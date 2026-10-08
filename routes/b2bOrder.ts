@@ -4,38 +4,11 @@
  */
 
 import { type Request, type Response, type NextFunction } from 'express'
-
-import * as challengeUtils from '../lib/challengeUtils'
-import { challenges } from '../data/datacache'
 import * as security from '../lib/insecurity'
-import * as utils from '../lib/utils'
 
 export function b2bOrder () {
-  return ({ body }: Request, res: Response, next: NextFunction) => {
-    if (utils.isChallengeEnabled(challenges.rceChallenge) || utils.isChallengeEnabled(challenges.rceOccupyChallenge)) {
-      const orderLinesData = body.orderLinesData
-      if (orderLinesData !== undefined && typeof orderLinesData !== 'string') {
-        res.status(400)
-        res.json({ error: 'Invalid order lines data' })
-        return
-      }
-      try {
-        if (orderLinesData) JSON.parse(orderLinesData)
-        res.json({ cid: body.cid, orderNo: uniqueOrderNumber(), paymentDue: dateTwoWeeksFromNow() })
-      } catch (err) {
-        if (utils.getErrorMessage(err).match(/Script execution timed out.*/) != null) {
-          challengeUtils.solveIf(challenges.rceOccupyChallenge, () => { return true })
-          res.status(503)
-          next(new Error('Sorry, we are temporarily not available! Please try again later.'))
-        } else {
-          challengeUtils.solveIf(challenges.rceChallenge, () => { return utils.getErrorMessage(err) === 'Infinite loop detected - reached max iterations' })
-          res.status(400)
-          res.json({ error: 'Invalid order lines data' })
-        }
-      }
-    } else {
-      res.json({ cid: body.cid, orderNo: uniqueOrderNumber(), paymentDue: dateTwoWeeksFromNow() })
-    }
+  return ({ body }: Request, res: Response, _next: NextFunction) => {
+    res.json({ cid: body.cid, orderNo: uniqueOrderNumber(), paymentDue: dateTwoWeeksFromNow() })
   }
 
   function uniqueOrderNumber () {

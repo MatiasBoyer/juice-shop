@@ -4,6 +4,8 @@
  */
 
 import crypto from 'node:crypto'
+import fs from 'node:fs'
+import path from 'node:path'
 import { type Request, type Response, type NextFunction } from 'express'
 import { type UserModel } from 'models/user'
 import expressJwt from 'express-jwt'
@@ -16,13 +18,80 @@ import * as utils from './utils'
 // @ts-expect-error FIXME no typescript definitions for z85 :(
 import * as z85 from 'z85'
 
-const privateKey = process.env.JWT_PRIVATE_KEY?.replace(/\\n/g, '\n') ?? crypto.generateKeyPairSync('rsa', {
-  modulusLength: 2048,
-  publicKeyEncoding: { type: 'spki', format: 'pem' },
-  privateKeyEncoding: { type: 'pkcs1', format: 'pem' }
-}).privateKey
+const jwtStateDirectory = path.resolve(process.env.JWT_SESSION_DIR ?? 'data/.jwt-auth')
+const revokedTokenDirectory = path.join(jwtStateDirectory, 'revoked')
+
+function ensurePrivateDirectory (directory: string) {
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 })
+  if (process.platform !== 'win32' && (fs.statSync(directory).mode & 0o077) !== 0) {
+    throw new Error(`JWT state directory must be private: ${directory}`)
+  }
+}
+
+ensurePrivateDirectory(jwtStateDirectory)
+ensurePrivateDirectory(revokedTokenDirectory)
+
+function writePrivateFileOnce (file: string, contents: string) {
+  const temporaryFile = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`
+  try {
+    fs.writeFileSync(temporaryFile, contents, { mode: 0o600, flag: 'wx' })
+    try {
+      fs.linkSync(temporaryFile, file)
+      return true
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false
+      throw error
+    }
+  } finally {
+    fs.rmSync(temporaryFile, { force: true })
+  }
+}
+
+function loadPrivateKey () {
+  const configuredKey = process.env.JWT_PRIVATE_KEY
+  if (configuredKey !== undefined) return configuredKey.replace(/\\n/g, '\n')
+
+  const keyFile = path.join(jwtStateDirectory, 'private.pem')
+  if (!fs.existsSync(keyFile)) {
+    const generatedKey = crypto.generateKeyPairSync('rsa', {
+      modulusLength: 2048,
+      publicKeyEncoding: { type: 'spki', format: 'pem' },
+      privateKeyEncoding: { type: 'pkcs1', format: 'pem' }
+    }).privateKey
+    writePrivateFileOnce(keyFile, generatedKey)
+  }
+
+  if (process.platform !== 'win32' && (fs.statSync(keyFile).mode & 0o077) !== 0) {
+    throw new Error(`JWT private key must be owner-readable only: ${keyFile}`)
+  }
+  return fs.readFileSync(keyFile, 'utf8')
+}
+
+const privateKey = loadPrivateKey()
 const publicKey = crypto.createPublicKey(privateKey).export({ type: 'spki', format: 'pem' }).toString()
 export { publicKey }
+
+function revocationFile (token: string) {
+  return path.join(revokedTokenDirectory, crypto.createHash('sha256').update(token).digest('hex'))
+}
+
+function isRevoked (token: string) {
+  try {
+    fs.statSync(revocationFile(token))
+    return true
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+    throw error
+  }
+}
+
+for (const entry of fs.readdirSync(revokedTokenDirectory)) {
+  if (!/^[a-f0-9]{64}$/.test(entry)) continue
+  const file = path.join(revokedTokenDirectory, entry)
+  const contents = fs.readFileSync(file, 'utf8')
+  const expiry = Number(contents)
+  if (/^\d+$/.test(contents) && Number.isSafeInteger(expiry) && expiry <= Math.floor(Date.now() / 1000)) fs.rmSync(file)
+}
 
 interface ResponseWithUser {
   status?: string
@@ -88,12 +157,10 @@ export const authorize = (user: any = {}) => {
   return `${signedData}.${signature}`
 }
 export const verify = (token?: string) => decode(token) !== undefined
-const revokedTokens = new Set<string>()
 export const decode = (token?: string): any => {
   if (!token) return undefined
   try {
     const unquotedToken = utils.unquote(token)
-    if (revokedTokens.has(unquotedToken)) return undefined
     const parts = unquotedToken.split('.')
     if (parts.length !== 3 || parts.some(part => !/^[\w-]+$/.test(part))) return undefined
     const header = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'))
@@ -105,6 +172,7 @@ export const decode = (token?: string): any => {
     const now = Math.floor(Date.now() / 1000)
     if (!payload || typeof payload !== 'object' || typeof payload.exp !== 'number' || payload.exp <= now) return undefined
     if (typeof payload.nbf === 'number' && payload.nbf > now) return undefined
+    if (isRevoked(unquotedToken)) return undefined
     return payload
   } catch {
     return undefined
@@ -116,7 +184,8 @@ export const revokeToken = (token: string) => {
   const claims = decode(unquotedToken)
   if (!claims?.data?.id) return false
 
-  revokedTokens.add(unquotedToken)
+  const file = revocationFile(unquotedToken)
+  if (!writePrivateFileOnce(file, String(claims.exp))) return false
   const user = authenticatedUsers.tokenMap[unquotedToken]
   delete authenticatedUsers.tokenMap[unquotedToken]
   if (user && authenticatedUsers.idMap[user.data.id] === unquotedToken) {
@@ -126,7 +195,9 @@ export const revokeToken = (token: string) => {
   const expiresInMs = typeof claims.exp === 'number'
     ? Math.max(0, claims.exp * 1000 - Date.now())
     : 6 * 60 * 60 * 1000
-  setTimeout(() => revokedTokens.delete(unquotedToken), expiresInMs).unref()
+  setTimeout(() => {
+    try { fs.rmSync(file, { force: true }) } catch { /* Retain an expired revocation until the next startup. */ }
+  }, expiresInMs).unref()
   return true
 }
 
@@ -164,6 +235,26 @@ export const authenticatedUsers: IAuthenticatedUsers = {
   updateFrom: function (req: Request, user: ResponseWithUser) {
     const token = utils.jwtFrom(req)
     this.put(token, user)
+  }
+}
+
+export const rehydrateAuthenticatedUsers = () => async (req: Request, _res: Response, next: NextFunction) => {
+  try {
+    const tokens = new Set([utils.jwtFrom(req), req.cookies?.token])
+    for (const token of tokens) {
+      if (typeof token !== 'string' || authenticatedUsers.get(token)) continue
+      const claims = decode(token)
+      if (claims?.status !== 'success' || !Number.isSafeInteger(claims.data?.id) || claims.data.id <= 0 || typeof claims.data.email !== 'string') continue
+
+      const { UserModel } = await import('../models/user')
+      const user = await UserModel.findByPk(claims.data.id)
+      if (user && user.email === claims.data.email) {
+        authenticatedUsers.put(token, { status: 'success', data: user, iat: claims.iat, exp: claims.exp })
+      }
+    }
+    next()
+  } catch (error) {
+    next(error)
   }
 }
 

@@ -302,6 +302,7 @@ function configureApp (app: ReturnType<typeof express>, seq: typeof sequelize) {
   app.use(express.static(path.resolve('frontend/dist/frontend')))
   app.use(cookieParser('kekse'))
   // vuln-code-snippet end directoryListingChallenge accessLogDisclosureChallenge
+  app.use(security.rehydrateAuthenticatedUsers())
 
   /* Serve vendor dependencies locally instead of from CDN */
   app.use('/vendor/beercss', express.static(path.resolve('node_modules/beercss/dist/cdn')))

@@ -13,9 +13,10 @@ function isAllowedImageUrl (value: unknown): value is string {
   if (typeof value !== 'string' || value.length > 2048) return false
   try {
     const parsed = new URL(value)
-    const hostname = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase()
+    const hostname = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase().replace(/\.$/, '')
     return (parsed.protocol === 'https:' || parsed.protocol === 'http:') &&
       !parsed.username && !parsed.password &&
+      hostname.includes('.') &&
       hostname !== 'localhost' && !hostname.endsWith('.localhost') &&
       !hostname.endsWith('.local') && !hostname.endsWith('.internal') &&
       isIP(hostname) === 0
